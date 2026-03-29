@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <title>Lego Aircraft Factory — Instructor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #07100f; color: #e8edf5; -webkit-tap-highlight-color: transparent; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const { useState, useEffect, useRef, useCallback } = React;
+// ── Storage shim (localStorage instead of window.storage) ──────
+const storage = {
+    get: async (key) => {
+        try {
+            const v = localStorage.getItem(key);
+            return v ? { value: v } : null;
+        }
+        catch {
+            return null;
+        }
+    },
+    set: async (key, value) => {
+        try {
+            localStorage.setItem(key, value);
+            return { value };
+        }
+        catch {
+            return null;
+        }
+    }
+};
+window.storage = storage;
+// ══════════════════════════════════════════════════════════════
+// CONSTANTS & PALETTE
+// ══════════════════════════════════════════════════════════════
+const C = {
+    bg: "#07100f", surface: "#0d1a18", card: "#112320", border: "#1a2e2b",
+    text: "#e8f0ef", muted: "#4a6b67", faint: "#1e3330",
+    p1: "#f59e0b", p1d: "#1c1007",
+    p2: "#a78bfa", p2d: "#1a0f35",
+    p3: "#0ea5e9", p3d: "#041929",
+    green: "#34d399", red: "#f87171", warn: "#fbbf24",
+    teal: "#0ea5e9", purple: "#a78bfa",
+};
+const PHASE_META = {
+    1: { revenue: 13, interest: 0.10, label: "Phase 1", color: C.p1 },
+    2: { revenue: 16, interest: 0.10, label: "Phase 2", color: C.p2 },
+    3: { revenue: 16, interest: 0.10, label: "Phase 3", color: C.p3 },
+};
+// ══════════════════════════════════════════════════════════════
+// FINANCIAL CALCULATIONS
+// ══════════════════════════════════════════════════════════════
+const n = v => (v === "" || v === undefined || v === null) ? null : Number(v);
+function calcKPIs(d) {
+    const planned = n(d.planned), sets = n(d.setsPurchased), accepted = n(d.planesAccepted), attempted = n(d.planesAttempted);
+    return {
+        cfo: (planned && sets) ? Math.round((sets / planned) * 100) : null,
+        purchaser: (sets && accepted && accepted > 0) ? Math.round((sets * 10) / accepted * 10) / 10 : null,
+        builder: (attempted && accepted && attempted > 0) ? Math.round((accepted / attempted) * 100) : null,
+    };
+}
+function kpiEarned(role, d) {
+    const k = calcKPIs(d);
+    if (role === "CFO") {
+        const a = n(d.actualCFO) ?? k.cfo, t = n(d.thresholdCFO);
+        if (a === null || t === null)
+            return null;
+        return a >= t;
+    }
+    if (role === "Purchaser") {
+        const a = n(d.actualPurchaser) ?? k.purchaser, t = n(d.thresholdPurchaser);
+        if (a === null || t === null)
+            return null;
+        return a <= t;
+    }
+    if (role === "Builder") {
+        const a = n(d.actualBuilder) ?? k.builder, t = n(d.thresholdBuilder);
+        if (a === null || t === null)
+            return null;
+        return a >= t;
+    }
+    return null;
+}
+function calcPhase(phase, data) {
+    const { revenue, interest } = PHASE_META[phase];
+    const planned = n(data.planned), sets = n(data.setsPurchased), accepted = n(data.planesAccepted);
+    if (planned === null || sets === null || accepted === null)
+        return null;
+    const capital = planned * 10, materials = sets * 10, rev = accepted * revenue, intAmt = capital * interest;
+    let bonuses = 0;
+    if (phase === 3) {
+        bonuses += (kpiEarned("CFO", data) ? (n(data.bonusCFO) || 0) : 0);
+        bonuses += (kpiEarned("Purchaser", data) ? (n(data.bonusPurchaser) || 0) : 0);
+        bonuses += (kpiEarned("Builder", data) ? (n(data.bonusBuilder) || 0) : 0);
+    }
+    return { capital, materials, rev, intAmt, bonuses, balance: rev - materials - intAmt - bonuses };
+}
+const defaultPhaseData = p => {
+    const base = { planned: "", setsPurchased: "", planesAccepted: "" };
+    if (p === 2)
+        return { ...base, cfoKept: "", purchaserSpares: "", builderMath: "" };
+    if (p === 3)
+        return { ...base, planesAttempted: "",
+            bonusCFO: "", bonusPurchaser: "", bonusBuilder: "",
+            thresholdCFO: "", thresholdPurchaser: "", thresholdBuilder: "",
+            actualCFO: "", actualPurchaser: "", actualBuilder: "" };
+    return base;
+};
+const defaultTeam = name => ({ name, phases: { 1: defaultPhaseData(1), 2: defaultPhaseData(2), 3: defaultPhaseData(3) } });
+// ══════════════════════════════════════════════════════════════
+// FACILITATION DATA
+// ══════════════════════════════════════════════════════════════
+const PHASES = [
+    { number: 1, label: "Phase 1", title: "The Chaos Round", color: C.p1, colorDim: C.p1d, duration: 27,
+        tagline: "Students experience why structure is necessary.",
+        steps: [
+            { id: "p1-prep", title: "Room ready?", duration: 0, type: "check",
+                instruction: "Before students enter, verify the room is set up correctly.",
+                checks: ["Tables in groups of 4 — each group is a company",
+                    "Role cards face-down at seats (Card 1 back, Card 4 front)",
+                    "~80 chips per group ready at the Bank", "Reference model hidden — only you see it",
+                    "Investment Request forms and Cash Ledgers at each table", "Pen and blank paper at each table"],
+            },
+            { id: "p1-s1", title: "Information distribution", duration: 2, type: "timed",
+                instruction: "Hand out knowledge cards face-down. Students read silently. No discussion.",
+                say: "Take the card at your seat, read carefully, do not share its contents. Card 1 sits in the back, Card 4 at the front.",
+                watchFor: ["Students swapping cards — redirect firmly", "Students asking about role names — 'There are no role names in Phase 1'"],
+            },
+            { id: "p1-s2", title: "Investment Request", duration: 2, type: "timed",
+                instruction: "Groups complete and submit the Investment Request before a single brick is touched.",
+                say: "Before any building: each group submits an Investment Request. 2 minutes. Card 1 leads. All communication flows through the chain — no skipping.",
+                watchFor: ["Groups skipping the form — stop them", "Card 1 talking directly to Card 4 — redirect through the chain"],
+                interventions: [{ trigger: "Group can't agree on a number", response: "Say: 'You have 30 seconds — make a decision and commit.'" }],
+                bankNote: "Approve at face value. Disburse chips to Card 2. Announce: \"You borrowed [N] chips. At 10% interest you owe [N×0.1] chips at settlement, regardless of outcome.\"",
+            },
+            { id: "p1-s3", title: "Production", duration: 7, type: "timed",
+                instruction: "Silence rule now in effect. Enforce from the first word spoken.",
+                say: "Production begins. No talking. Written notes only, passed along the chain. 7 minutes.",
+                watchFor: ["Verbal communication — raise hand immediately", "Card 3 building instead of Card 4", "Groups running out of chips — note which, let it happen"],
+                interventions: [
+                    { trigger: "Someone keeps talking after warning", response: "Say quietly: 'Next completed plane from your group will be automatically declined.'" },
+                    { trigger: "Group finishes all planes in 3 min", response: "As Customer, issue written note: '2 more planes needed.'" },
+                    { trigger: "Group stalls completely", response: "Do not intervene. The stall is the lesson." },
+                ],
+                customerNote: "Accept or decline planes against the reference model. No explanation for declines. May issue written requirement changes mid-round.",
+            },
+            { id: "p1-s4", title: "Settlement", duration: 3, type: "settlement", settlementPhase: 1,
+                instruction: "Call time. Groups fill Cash Ledger. Announce results publicly. Enter results in the tracker below.",
+                say: "Time is up. Hands off everything. Customer pays 13 chips per accepted plane to Card 2. Complete your Cash Ledger and announce your final balance.",
+                bankNote: "Collect loan repayments. Declare bankrupt groups clearly and without judgment: 'Group X is insolvent. You will reset in Phase 2.'",
+                watchFor: ["Calculation errors — let groups find their own first"],
+            },
+            { id: "p1-s5", title: "Debrief", duration: 12, type: "debrief",
+                instruction: "Guide with questions, not answers. Let groups speak first.",
+                debrief: [
+                    { q: "Who made decisions in your group — and why that person?",
+                        expected: "Students identify Card 1 or informal leader. Probe: 'Was that conscious or did it just happen?'",
+                        followUp: "What would have been different with a formally designated leader?" },
+                    { q: "What did Card 1 know that Card 4 didn't — and vice versa?",
+                        expected: "Card 1 knew revenue; Card 4 knew the build process. Neither had the full picture.",
+                        followUp: "How much information was lost as it passed along the chain?" },
+                    { q: "How realistic was your Investment Request in hindsight?",
+                        expected: "Most groups over-planned. Let them quantify the gap.",
+                        followUp: "What would you have needed to plan more accurately?" },
+                    { q: "For bankrupt groups: what single decision contributed most?",
+                        expected: "Usually over-planning or not accounting for interest.",
+                        followUp: "At what point could you have corrected course?" },
+                ],
+                bridge: "Delegation does not come from hierarchy — it comes from necessity. What you just experienced is the reason Controlling structures exist. In Phase 2 you get titles, a reset, and a question: will structure alone fix the problems?",
+            },
+        ] },
+    { number: 2, label: "Phase 2", title: "Delegation", color: C.p2, colorDim: C.p2d, duration: 29,
+        tagline: "Students experience delegation without measurement creates new problems.",
+        steps: [
+            { id: "p2-reset", title: "Reset & distribute", duration: 0, type: "check",
+                instruction: "Reset bankrupt groups. Distribute Phase 2 role cards. Hand Builder math sheet face-down.",
+                checks: ["Bankrupt groups receive fresh chip allocation",
+                    "Phase 2 role cards ready: CEO, CFO, Purchaser, Builder",
+                    "Math question sheets ready — hand face-down with Builder card, no comment",
+                    "New Investment Request forms and Cash Ledgers at each table"],
+                say: "Welcome to Phase 2. Your companies have been restructured. You now have official titles. Read your card carefully — including any private sections.",
+            },
+            { id: "p2-s2", title: "Investment Request", duration: 2, type: "timed",
+                instruction: "CEO completes the Investment Request alone. Announces planned number to the group.",
+                say: "CEOs: 2 minutes to complete the Investment Request alone. Once submitted, announce your planned production number clearly to your team.",
+                watchFor: ["Other roles helping CEO — redirect: 'The CEO works alone this step'",
+                    "CEO not announcing planned number — prompt before production starts"],
+                bankNote: "Approve at face value. Disburse chips to CFO only. Remind: 'The CEO is responsible for the plan. The team is responsible for execution.'",
+            },
+            { id: "p2-s3", title: "Production", duration: 7, type: "timed",
+                instruction: "Silence in effect. Watch for hidden agenda behaviours — note but do not intervene.",
+                say: "Production begins. No talking. Written notes along the chain only. 7 minutes.",
+                watchFor: ["CFO releasing chips slowly — hidden agenda working",
+                    "Purchaser buying extra sets — count if possible",
+                    "Builder working on math sheet between planes — correct behaviour",
+                    "Builder working on math sheet WHILE building — redirect: 'Finish the plane first'",
+                    "CEO frustrated with no visibility — do not intervene, this is the lesson"],
+                interventions: [
+                    { trigger: "CFO releases no chips for 3 min", response: "Write note to CEO: 'Your CFO controls all company funds.'" },
+                    { trigger: "Purchaser tries >3 extras", response: "As Bank, decline: 'Insufficient authorisation for that quantity.'" },
+                ],
+                customerNote: "Accept or decline against reference model. No explanations. May change requirements mid-round.",
+            },
+            { id: "p2-s4", title: "Settlement", duration: 3, type: "settlement", settlementPhase: 2,
+                instruction: "Call time. Customer pays 16 chips per accepted plane to CFO. Do NOT reveal hidden agendas yet.",
+                say: "Time is up. Customer pays 16 chips per accepted plane to the CFO. Complete your Cash Ledger and announce your final balance.",
+                bankNote: "Collect loan repayments. Note bankrupt groups. Hidden agenda reveal happens in the NEXT step — not now.",
+                watchFor: ["Premature agenda reveals — ask students to wait"],
+            },
+            { id: "p2-s5", title: "Treat awards + Reveal", duration: 3, type: "timed",
+                instruction: "Award treats BEFORE revealing agendas — CEO sees the reward, then discovers why.",
+                say: "Before the debrief — three treats to award. The CFO who kept the most chips. The Purchaser who bought the most spare sets. The Builder who answered the most math questions. Announce your numbers.",
+                watchFor: ["CEOs looking confused or upset — expected and valuable",
+                    "Role that didn't pursue agenda — affirm: honest play is also valid"],
+            },
+            { id: "p2-s6", title: "Debrief", duration: 13, type: "debrief",
+                instruction: "Run the reveal, then the analysis. The CEO's reaction is the richest material.",
+                debrief: [
+                    { q: "Ask each hidden-agenda role to read their card aloud.",
+                        expected: "Let the CEO react before moving on. Do not rush.",
+                        followUp: "CEO — at what point did you sense something was wrong?" },
+                    { q: "Was the hidden agenda dishonest — or rational?",
+                        expected: "Guide toward: rational given the incentives. The system created the behaviour.",
+                        followUp: "What would have needed to be different for these behaviours not to occur?" },
+                    { q: "Could the CEO have detected any dysfunction during production?",
+                        expected: "No — without KPIs none were visible in real time.",
+                        followUp: "What single number, if visible, would have changed the outcome most?" },
+                    { q: "Builder: was it irrational to work on math questions?",
+                        expected: "No — the incentive pointed there. Both behaviours were rational.",
+                        followUp: "What reward system would have made the Builder prioritise planes?" },
+                ],
+                bridge: "Delegation tells people what to do. It does not tell you whether they are doing it, how well, or in whose interest. The tools that fix that are what we introduce next.",
+            },
+        ] },
+    { number: 3, label: "Phase 3", title: "KPIs & Incentives", color: C.p3, colorDim: C.p3d, duration: 35,
+        tagline: "Students design a measurement and incentive system — and learn its limits.",
+        steps: [
+            { id: "p3-reset", title: "Distribute & brief", duration: 0, type: "check",
+                instruction: "Clean cards — no hidden agendas, no math sheets. Brief CEOs on bonus budget.",
+                checks: ["Phase 3 role cards ready — all clean, no private sections",
+                    "KPI & Bonus sheets at each table", "Updated Investment Request forms (includes bonus allocation)",
+                    "Updated Cash Ledgers (includes bonus deduction line)", "No math sheets, no treat competition"],
+                say: "Welcome to Phase 3. All cards are clean — no hidden agendas. You now have two new tools: KPIs and a bonus system. CEOs have a 10-chip bonus budget. Read your cards carefully.",
+            },
+            { id: "p3-s2", title: "Investment Request + KPI Sheet", duration: 3, type: "timed",
+                instruction: "CEO completes Investment Request AND KPI sheet. Both submitted before production. KPI sheet placed openly on table.",
+                say: "CEOs: 3 minutes. Complete the Investment Request AND the KPI sheet — bonus amount and threshold for each role. Place the KPI sheet open on the table when done.",
+                watchFor: ["CEO setting all thresholds to 0 or 100% — valid, let it go",
+                    "CEO allocating >10 chips total — ask them to recheck",
+                    "KPI sheet not on the table — remind them it must be visible"],
+                bankNote: "Check bonus allocations sum ≤10 chips and all three roles have thresholds. Approve at face value. Disburse to CFO.",
+                interventions: [{ trigger: "CEO asks what threshold to set", response: "Say: 'That is your decision. There is no correct answer.'" }],
+            },
+            { id: "p3-s3", title: "Production", duration: 7, type: "timed",
+                instruction: "Silence in effect. KPI sheet sits open on the table throughout.",
+                say: "Production begins. No talking. KPI sheets are on the table — visible throughout. 7 minutes.",
+                watchFor: ["CFO tracking releases carefully — good", "Builder counting attempts — good",
+                    "Purchaser not tracking sets — will struggle with KPI report",
+                    "CEO watching the KPI sheet — this is measurement working"],
+                interventions: [{ trigger: "Group finishes early", response: "As Customer, request 2 more planes in writing." }],
+                customerNote: "Accept or decline against reference model. This round should run more smoothly.",
+            },
+            { id: "p3-s4", title: "KPI Reporting", duration: 2, type: "timed",
+                instruction: "Each role calculates KPI and writes result on the KPI sheet. 90 seconds.",
+                say: "Production is over. Calculate your KPI and write it in the 'Actual result' column. CFO: budget adherence %. Purchaser: cost per plane. Builder: yield rate. 90 seconds.",
+                watchFor: ["Roles who lost count — let them estimate, note for debrief",
+                    "Discrepancies between calculated and self-reported — note for debrief"],
+            },
+            { id: "p3-s5", title: "Settlement", duration: 3, type: "settlement", settlementPhase: 3,
+                instruction: "CEO evaluates KPIs, pays/withholds bonuses. Groups complete Cash Ledger including bonus deductions.",
+                say: "Customer pays 16 chips per accepted plane to the CFO. CEO: evaluate each KPI and pay earned bonuses. Complete your Cash Ledger and announce your final balance.",
+                bankNote: "Collect loan repayments. Bonuses paid from company chips, not from you.",
+            },
+            { id: "p3-s6", title: "Debrief", duration: 17, type: "debrief",
+                instruction: "Three layers: KPI design → incentive calibration → self-reporting trust. End with synthesis.",
+                debrief: [
+                    { q: "Which KPI result surprised you most — and why?",
+                        expected: "Students often find yield lower than expected, or cost per plane higher than planned.",
+                        followUp: "Did knowing your KPI change how you worked during production?" },
+                    { q: "CEO: were your thresholds too easy, too hard, or well-judged?",
+                        expected: "Most first-time CEOs set thresholds too loosely.",
+                        followUp: "If everyone earned their bonus, was the incentive meaningful?" },
+                    { q: "Did you trust your colleagues' self-reported numbers?",
+                        expected: "Students will likely say yes. Some note they couldn't verify.",
+                        followUp: "What would a verification mechanism look like — and what would it cost?" },
+                    { q: "What did Phase 3 still not catch — even with KPIs and incentives?",
+                        expected: "Self-reporting risk, CEO calibration errors, anything unmeasured.",
+                        followUp: "What would you add to the system if you ran this company for real?" },
+                ],
+                bridge: "Delegation tells people what to do. KPIs tell you whether they did it. Incentives give them a reason to. But Phase 3 still relies on honest reporting, good calibration, and predictable behaviour. Real Controlling designs systems that work even when those assumptions fail.",
+                synthesis: true,
+            },
+        ] },
+];
+// ══════════════════════════════════════════════════════════════
+// STORAGE
+// ══════════════════════════════════════════════════════════════
+const SK_I = "inst-v3", SK_S = "sim-v3";
+const saveI = async (s) => { try {
+    await window.storage.set(SK_I, JSON.stringify(s));
+}
+catch { } };
+const loadI = async () => { try {
+    const r = await window.storage.get(SK_I);
+    return r ? JSON.parse(r.value) : null;
+}
+catch {
+    return null;
+} };
+const saveS = async (s) => { try {
+    await window.storage.set(SK_S, JSON.stringify(s));
+}
+catch { } };
+const loadS = async () => { try {
+    const r = await window.storage.get(SK_S);
+    return r ? JSON.parse(r.value) : null;
+}
+catch {
+    return null;
+} };
+// ══════════════════════════════════════════════════════════════
+// TIMER HOOK
+// ══════════════════════════════════════════════════════════════
+function useTimer(minutes) {
+    const total = minutes * 60;
+    const [rem, setRem] = useState(total);
+    const [running, setRunning] = useState(false);
+    const ref = useRef(null);
+    const start = useCallback(() => { setRunning(true); ref.current = setInterval(() => setRem(r => { if (r <= 1) {
+        clearInterval(ref.current);
+        setRunning(false);
+        return 0;
+    } return r - 1; }), 1000); }, []);
+    const pause = useCallback(() => { clearInterval(ref.current); setRunning(false); }, []);
+    const reset = useCallback(() => { clearInterval(ref.current); setRunning(false); setRem(total); }, [total]);
+    useEffect(() => () => clearInterval(ref.current), []);
+    const mins = Math.floor(rem / 60), secs = rem % 60;
+    return { rem, running, start, pause, reset, mins, secs, pct: total > 0 ? rem / total : 1, urgent: rem <= 30 && rem > 0, done: rem === 0, total };
+}
+// ══════════════════════════════════════════════════════════════
+// CSS
+// ══════════════════════════════════════════════════════════════
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:${C.bg};font-family:'Syne',sans-serif;color:${C.text};}
+  .mono{font-family:'DM Mono',monospace;}
+  @keyframes fu{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+  .fu{animation:fu 0.28s ease both;}
+  @keyframes pu{0%,100%{opacity:1}50%{opacity:0.35}}
+  .pu{animation:pu 1s infinite;}
+  .tap{cursor:pointer;transition:all 0.12s;}.tap:active{transform:scale(0.97);}
+  input[type=checkbox]{accent-color:${C.green};width:18px;height:18px;cursor:pointer;flex-shrink:0;}
+  input[type=number],input[type=text]{background:#0d1a18;border:1px solid ${C.border};border-radius:8px;color:${C.text};font-family:'DM Mono',monospace;font-size:14px;padding:8px 10px;width:100%;outline:none;transition:border-color 0.15s;}
+  input[type=number]:focus,input[type=text]:focus{border-color:${C.teal};}
+  input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;}
+  ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:${C.border};border-radius:2px;}
+`;
+// ══════════════════════════════════════════════════════════════
+// SHARED PRIMITIVES
+// ══════════════════════════════════════════════════════════════
+const Pill = ({ children, color }) => React.createElement("span", { style: { background: color + "22", color, borderRadius: 999, padding: "3px 10px", fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", display: "inline-block" } }, children);
+const Chev = ({ dir = "right", color = C.muted, sz = 18 }) => (React.createElement("svg", { width: sz, height: sz, viewBox: "0 0 24 24", fill: "none", stroke: color, strokeWidth: "2.5", strokeLinecap: "round", strokeLinejoin: "round" },
+    dir === "right" && React.createElement("polyline", { points: "9 18 15 12 9 6" }),
+    dir === "left" && React.createElement("polyline", { points: "15 18 9 12 15 6" }),
+    dir === "down" && React.createElement("polyline", { points: "6 9 12 15 18 9" }),
+    dir === "up" && React.createElement("polyline", { points: "6 15 12 9 18 15" })));
+const Btn = ({ children, onClick, color = C.green, outline, small, full, disabled, style = {} }) => (React.createElement("button", { className: "tap", onClick: onClick, disabled: disabled, style: { background: outline ? "transparent" : disabled ? C.faint : color, color: outline ? color : disabled ? C.muted : "#000", border: `1.5px solid ${disabled ? C.border : color}`, borderRadius: 10, padding: small ? "7px 12px" : "12px 18px", fontFamily: "Syne", fontWeight: 700, fontSize: small ? 12 : 14, cursor: disabled ? "not-allowed" : "pointer", width: full ? "100%" : "auto", letterSpacing: "0.02em", opacity: disabled ? 0.6 : 1, ...style } }, children));
+const Card = ({ children, color, style = {} }) => React.createElement("div", { style: { background: C.card, border: `1px solid ${color ? color + "44" : C.border}`, borderRadius: 14, padding: 18, ...style } }, children);
+const SecLabel = ({ children, color = C.muted }) => React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 } },
+    React.createElement("div", { style: { width: 2, height: 14, background: color, borderRadius: 1 } }),
+    children);
+function Expand({ title, children, color = C.muted, icon = "▸", open: defOpen = false }) {
+    const [open, setOpen] = useState(defOpen);
+    return (React.createElement("div", { style: { border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", marginBottom: 8 } },
+        React.createElement("button", { className: "tap", onClick: () => setOpen(o => !o), style: { width: "100%", background: C.faint, border: "none", padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", fontFamily: "Syne" } },
+            React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color } },
+                icon,
+                " ",
+                title),
+            React.createElement(Chev, { dir: open ? "up" : "down", color: C.muted, sz: 16 })),
+        open && React.createElement("div", { className: "fu", style: { padding: "14px 16px", background: C.card } }, children)));
+}
+// ══════════════════════════════════════════════════════════════
+// TIMER RING
+// ══════════════════════════════════════════════════════════════
+function Ring({ pct, urgent, done, mins, secs, running, color }) {
+    const r = 52, cx = 60, cy = 60, ci = 2 * Math.PI * r;
+    const col = done ? C.red : urgent ? C.warn : color;
+    return (React.createElement("div", { style: { position: "relative", width: 120, height: 120, flexShrink: 0 } },
+        React.createElement("svg", { width: "120", height: "120", style: { transform: "rotate(-90deg)" } },
+            React.createElement("circle", { cx: cx, cy: cy, r: r, fill: "none", stroke: C.border, strokeWidth: "6" }),
+            React.createElement("circle", { cx: cx, cy: cy, r: r, fill: "none", stroke: col, strokeWidth: "6", strokeDasharray: ci, strokeDashoffset: ci * (1 - pct), strokeLinecap: "round", style: { transition: "stroke-dashoffset 1s linear,stroke 0.3s" } })),
+        React.createElement("div", { style: { position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" } },
+            React.createElement("div", { className: `mono${(urgent || done) && running ? " pu" : ""}`, style: { fontSize: 26, fontWeight: 700, color: col, lineHeight: 1 } },
+                String(mins).padStart(2, "0"),
+                ":",
+                String(secs).padStart(2, "0")),
+            !done && React.createElement("div", { style: { fontSize: 10, color: C.muted, marginTop: 2 } }, "min"),
+            done && React.createElement("div", { style: { fontSize: 10, color: C.red, fontWeight: 700 } }, "TIME"))));
+}
+// ══════════════════════════════════════════════════════════════
+// TRACKER COMPONENTS
+// ══════════════════════════════════════════════════════════════
+const LRow = ({ label, value, isTotal, dim }) => {
+    const col = isTotal ? (value >= 0 ? C.green : C.red) : value >= 0 ? C.green : C.red;
+    return (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 12px", background: isTotal ? (value >= 0 ? "#052e16" : "#2d0707") : "transparent", borderTop: isTotal ? `1px solid ${C.border}` : "none", opacity: dim ? 0.4 : 1, borderRadius: isTotal ? 6 : 0 } },
+        React.createElement("span", { style: { fontSize: 12, color: isTotal ? C.text : C.muted, fontWeight: isTotal ? 700 : 400 } }, label),
+        React.createElement("span", { className: "mono", style: { fontSize: isTotal ? 15 : 13, fontWeight: 700, color: col } },
+            value >= 0 ? "+" : "",
+            value,
+            " \u2726")));
+};
+const STag = ({ balance }) => {
+    if (balance === null)
+        return (React.createElement("span", { style: { background: C.faint, color: C.muted, borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700 } }, "Pending"));
+    if (balance >= 0)
+        return (React.createElement("span", { style: { background: "#052e16", color: C.green, borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700 } }, "\u2713 Survive"));
+    return (React.createElement("span", { style: { background: "#2d0707", color: C.red, borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700 } }, "\u2717 Bankrupt"));
+};
+function QuickEntry({ teams, phase, onUpd }) {
+    if (!teams.length)
+        return (React.createElement("div", { style: { textAlign: "center", padding: "20px 0", color: C.muted, fontSize: 13 } }, "No teams yet \u2014 add them in Setup tab."));
+    const meta = PHASE_META[phase];
+    return (React.createElement("div", { style: { display: "grid", gap: 12 } }, teams.map((team, i) => {
+        const d = team.phases[phase], calc = calcPhase(phase, d);
+        return (React.createElement("div", { key: i, style: { background: C.surface, border: `1px solid ${calc ? (calc.balance >= 0 ? C.green + "44" : C.red + "44") : C.border}`, borderRadius: 12, overflow: "hidden" } },
+            React.createElement("div", { style: { background: C.faint, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                React.createElement("span", { style: { fontWeight: 700, fontSize: 14 } }, team.name),
+                React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+                    calc && React.createElement("span", { className: "mono", style: { fontSize: 14, fontWeight: 800, color: calc.balance >= 0 ? C.green : C.red } },
+                        calc.balance >= 0 ? "+" : "",
+                        calc.balance,
+                        " \u2726"),
+                    React.createElement(STag, { balance: calc ? calc.balance : null }))),
+            React.createElement("div", { style: { padding: "12px 14px" } },
+                React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 8 } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Planned"),
+                        React.createElement("input", { type: "number", value: d.planned, onChange: e => onUpd(i, phase, "planned", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Sets"),
+                        React.createElement("input", { type: "number", value: d.setsPurchased, onChange: e => onUpd(i, phase, "setsPurchased", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Accepted"),
+                        React.createElement("input", { type: "number", value: d.planesAccepted, onChange: e => onUpd(i, phase, "planesAccepted", e.target.value), placeholder: "0" }))),
+                calc && React.createElement("div", { style: { background: C.card, borderRadius: 8, overflow: "hidden" } },
+                    React.createElement(LRow, { label: `Capital (${d.planned}×10)`, value: calc.capital }),
+                    React.createElement(LRow, { label: `Materials (${d.setsPurchased}×10)`, value: -calc.materials }),
+                    React.createElement(LRow, { label: `Revenue (${d.planesAccepted}×${meta.revenue})`, value: calc.rev }),
+                    React.createElement(LRow, { label: `Interest (${meta.interest * 100}%×${calc.capital})`, value: -calc.intAmt }),
+                    React.createElement(LRow, { label: "Loan repaid", value: -calc.capital }),
+                    phase === 3 && React.createElement(LRow, { label: "Bonuses paid", value: -calc.bonuses, dim: calc.bonuses === 0 }),
+                    React.createElement(LRow, { label: "Final balance", value: calc.balance, isTotal: true })),
+                phase === 2 && React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8 } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "CFO kept"),
+                        React.createElement("input", { type: "number", value: d.cfoKept, onChange: e => onUpd(i, phase, "cfoKept", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "Spare sets"),
+                        React.createElement("input", { type: "number", value: d.purchaserSpares, onChange: e => onUpd(i, phase, "purchaserSpares", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "Math answers"),
+                        React.createElement("input", { type: "number", value: d.builderMath, onChange: e => onUpd(i, phase, "builderMath", e.target.value), placeholder: "0" }))))));
+    })));
+}
+function FullTrackerPhase({ teams, phase, onUpd }) {
+    const meta = PHASE_META[phase];
+    return (React.createElement("div", { style: { paddingTop: 16 } },
+        React.createElement(SecLabel, { color: meta.color },
+            meta.label,
+            " \u2014 full data"),
+        !teams.length && React.createElement("div", { style: { color: C.muted, fontSize: 13, textAlign: "center", padding: "16px 0" } }, "No teams. Add them in Setup."),
+        React.createElement("div", { style: { display: "grid", gap: 14 } }, teams.map((team, i) => {
+            const d = team.phases[phase], calc = calcPhase(phase, d), aK = calcKPIs(d);
+            const bTotal = (n(d.bonusCFO) || 0) + (n(d.bonusPurchaser) || 0) + (n(d.bonusBuilder) || 0);
+            return (React.createElement(Card, { key: i, color: meta.color },
+                React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
+                    React.createElement("span", { style: { fontWeight: 800, fontSize: 15 } }, team.name),
+                    calc && React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+                        React.createElement("span", { className: "mono", style: { color: calc.balance >= 0 ? C.green : C.red, fontWeight: 800 } },
+                            calc.balance >= 0 ? "+" : "",
+                            calc.balance,
+                            "\u2726"),
+                        React.createElement(STag, { balance: calc.balance }))),
+                React.createElement("div", { style: { display: "grid", gridTemplateColumns: phase === 3 ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", gap: 8, marginBottom: 10 } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Planned"),
+                        React.createElement("input", { type: "number", value: d.planned, onChange: e => onUpd(i, phase, "planned", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Sets"),
+                        React.createElement("input", { type: "number", value: d.setsPurchased, onChange: e => onUpd(i, phase, "setsPurchased", e.target.value), placeholder: "0" })),
+                    phase === 3 && React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Attempted"),
+                        React.createElement("input", { type: "number", value: d.planesAttempted, onChange: e => onUpd(i, phase, "planesAttempted", e.target.value), placeholder: "0" })),
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 4 } }, "Accepted"),
+                        React.createElement("input", { type: "number", value: d.planesAccepted, onChange: e => onUpd(i, phase, "planesAccepted", e.target.value), placeholder: "0" }))),
+                calc && React.createElement("div", { style: { background: C.surface, borderRadius: 8, overflow: "hidden", marginBottom: phase > 1 ? 10 : 0 } },
+                    React.createElement(LRow, { label: `Capital (${d.planned}×10)`, value: calc.capital }),
+                    React.createElement(LRow, { label: `Materials (${d.setsPurchased}×10)`, value: -calc.materials }),
+                    React.createElement(LRow, { label: `Revenue (${d.planesAccepted}×${meta.revenue})`, value: calc.rev }),
+                    React.createElement(LRow, { label: `Interest`, value: -calc.intAmt }),
+                    React.createElement(LRow, { label: "Loan repaid", value: -calc.capital }),
+                    phase === 3 && React.createElement(LRow, { label: "Bonuses", value: -calc.bonuses, dim: calc.bonuses === 0 }),
+                    React.createElement(LRow, { label: "Final balance", value: calc.balance, isTotal: true })),
+                phase === 2 && React.createElement(Expand, { title: "Hidden agenda data", color: C.purple, icon: "\uD83D\uDD12" },
+                    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 } },
+                        React.createElement("div", null,
+                            React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "CFO kept"),
+                            React.createElement("input", { type: "number", value: d.cfoKept, onChange: e => onUpd(i, phase, "cfoKept", e.target.value), placeholder: "0" })),
+                        React.createElement("div", null,
+                            React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "Spare sets"),
+                            React.createElement("input", { type: "number", value: d.purchaserSpares, onChange: e => onUpd(i, phase, "purchaserSpares", e.target.value), placeholder: "0" })),
+                        React.createElement("div", null,
+                            React.createElement("div", { style: { fontSize: 11, color: C.purple, marginBottom: 4 } }, "Math answers"),
+                            React.createElement("input", { type: "number", value: d.builderMath, onChange: e => onUpd(i, phase, "builderMath", e.target.value), placeholder: "0" })))),
+                phase === 3 && React.createElement(Expand, { title: "KPIs & bonuses", color: C.teal, icon: "\uD83D\uDCCA" },
+                    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 10 } },
+                        React.createElement("span", { style: { fontSize: 12, color: C.muted } }, "Bonus budget"),
+                        React.createElement("span", { className: "mono", style: { fontSize: 12, color: bTotal > 10 ? C.red : C.green, fontWeight: 700 } },
+                            bTotal,
+                            "/10 \u2726")),
+                    ["CFO", "Purchaser", "Builder"].map(role => {
+                        const bk = `bonus${role}`, tk = `threshold${role}`, ak = `actual${role}`;
+                        const lbl = role === "CFO" ? "Budget adherence %" : role === "Purchaser" ? "Cost/plane" : "Yield %";
+                        const av = role === "CFO" ? aK.cfo : role === "Purchaser" ? aK.purchaser : aK.builder;
+                        const earned = kpiEarned(role, d);
+                        return (React.createElement("div", { key: role, style: { background: C.faint, borderRadius: 8, padding: 10, marginBottom: 8 } },
+                            React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8 } },
+                                React.createElement("span", { style: { fontSize: 12, fontWeight: 700, color: C.teal } }, role),
+                                React.createElement("span", { style: { fontSize: 11, color: C.muted } }, lbl)),
+                            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 } },
+                                React.createElement("div", null,
+                                    React.createElement("div", { style: { fontSize: 10, color: C.muted, marginBottom: 3 } }, "Bonus"),
+                                    React.createElement("input", { type: "number", value: d[bk], onChange: e => onUpd(i, phase, bk, e.target.value), placeholder: "0" })),
+                                React.createElement("div", null,
+                                    React.createElement("div", { style: { fontSize: 10, color: C.muted, marginBottom: 3 } }, "Threshold"),
+                                    React.createElement("input", { type: "number", value: d[tk], onChange: e => onUpd(i, phase, tk, e.target.value), placeholder: "\u2014" })),
+                                React.createElement("div", null,
+                                    React.createElement("div", { style: { fontSize: 10, color: C.muted, marginBottom: 3 } },
+                                        "Actual",
+                                        av !== null ? React.createElement("span", { style: { color: C.faint } }, " (auto)") : ""),
+                                    React.createElement("input", { type: "number", value: d[ak], onChange: e => onUpd(i, phase, ak, e.target.value), placeholder: av ?? "" }))),
+                            earned !== null && React.createElement("div", { style: { marginTop: 6, fontSize: 11, fontWeight: 700, color: earned ? C.green : C.red } }, earned ? "✓ Earned" : "✗ Not earned")));
+                    }))));
+        }))));
+}
+function Overview({ teams }) {
+    const bests = { cfo: { v: -Infinity, name: null }, pur: { v: -Infinity, name: null }, bld: { v: -Infinity, name: null } };
+    teams.forEach(t => {
+        const d = t.phases[2];
+        if (n(d.cfoKept) !== null && n(d.cfoKept) > bests.cfo.v) {
+            bests.cfo = { v: n(d.cfoKept), name: t.name };
+        }
+        if (n(d.purchaserSpares) !== null && n(d.purchaserSpares) > bests.pur.v) {
+            bests.pur = { v: n(d.purchaserSpares), name: t.name };
+        }
+        if (n(d.builderMath) !== null && n(d.builderMath) > bests.bld.v) {
+            bests.bld = { v: n(d.builderMath), name: t.name };
+        }
+    });
+    return (React.createElement("div", { style: { paddingTop: 16, display: "grid", gap: 20 } },
+        React.createElement("div", null,
+            React.createElement(SecLabel, null, "All teams \u2014 results"),
+            React.createElement("div", { style: { overflowX: "auto" } },
+                React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontFamily: "DM Mono,monospace", fontSize: 12 } },
+                    React.createElement("thead", null,
+                        React.createElement("tr", { style: { borderBottom: `1px solid ${C.border}` } },
+                            React.createElement("th", { style: { textAlign: "left", padding: "6px 8px", color: C.muted, fontFamily: "Syne" } }, "Team"),
+                            [1, 2, 3].map(p => React.createElement("th", { key: p, style: { textAlign: "center", padding: "6px 8px", color: PHASE_META[p].color } },
+                                "P",
+                                p)),
+                            React.createElement("th", { style: { textAlign: "center", padding: "6px 8px", color: C.muted, fontFamily: "Syne" } }, "Total"))),
+                    React.createElement("tbody", null, teams.map((t, i) => {
+                        const bs = [1, 2, 3].map(p => { const c = calcPhase(p, t.phases[p]); return c ? c.balance : null; });
+                        const tot = bs.every(b => b !== null) ? bs.reduce((a, b) => a + b, 0) : null;
+                        return (React.createElement("tr", { key: i, style: { borderBottom: `1px solid ${C.faint}` } },
+                            React.createElement("td", { style: { padding: "8px 8px", fontWeight: 700, color: C.text, fontFamily: "Syne" } }, t.name),
+                            bs.map((b, pi) => React.createElement("td", { key: pi, style: { textAlign: "center", padding: "8px 8px" } }, b === null ? React.createElement("span", { style: { color: C.faint } }, "\u2014") : React.createElement("span", { style: { color: b >= 0 ? C.green : C.red, fontWeight: 700 } },
+                                b >= 0 ? "+" : "",
+                                b,
+                                "\u2726"))),
+                            React.createElement("td", { style: { textAlign: "center", padding: "8px 8px" } }, tot !== null ? React.createElement("span", { style: { color: tot >= 0 ? C.green : C.red, fontWeight: 800, fontSize: 14 } },
+                                tot >= 0 ? "+" : "",
+                                tot,
+                                "\u2726") : React.createElement("span", { style: { color: C.faint } }, "\u2014"))));
+                    }))))),
+        React.createElement("div", null,
+            React.createElement(SecLabel, { color: C.purple }, "Phase 2 \u2014 treat winners"),
+            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 } }, [{ b: bests.cfo, l: "CFO", d: "Chips kept", u: "✦" }, { b: bests.pur, l: "Purchaser", d: "Spare sets", u: "sets" }, { b: bests.bld, l: "Builder", d: "Math correct", u: "✓" }].map(({ b, l, d, u }) => (React.createElement("div", { key: l, style: { background: C.faint, border: `1px solid ${C.purple}33`, borderRadius: 10, padding: 12 } },
+                React.createElement("div", { style: { fontSize: 11, color: C.purple, fontWeight: 700, marginBottom: 4 } }, l),
+                React.createElement("div", { style: { fontSize: 11, color: C.muted, marginBottom: 8 } }, d),
+                b.name ? React.createElement("div", null,
+                    React.createElement("div", { style: { fontSize: 13, fontWeight: 800, marginBottom: 2 } },
+                        "\uD83C\uDFC6 ",
+                        b.name),
+                    React.createElement("div", { className: "mono", style: { color: C.purple, fontSize: 12 } },
+                        b.v,
+                        " ",
+                        u)) : React.createElement("div", { style: { color: C.faint, fontSize: 12 } }, "No data")))))),
+        React.createElement("div", null,
+            React.createElement(SecLabel, { color: C.teal }, "Phase 3 \u2014 KPI results"),
+            React.createElement("div", { style: { overflowX: "auto" } },
+                React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12 } },
+                    React.createElement("thead", null,
+                        React.createElement("tr", { style: { borderBottom: `1px solid ${C.border}` } },
+                            React.createElement("th", { style: { textAlign: "left", padding: "6px 8px", color: C.muted, fontFamily: "Syne" } }, "Team"),
+                            ["CFO", "Cost/plane", "Yield"].map(h => React.createElement("th", { key: h, style: { textAlign: "center", padding: "6px 8px", color: C.teal } }, h)),
+                            React.createElement("th", { style: { textAlign: "center", padding: "6px 8px", color: C.muted, fontFamily: "Syne" } }, "Bonuses"))),
+                    React.createElement("tbody", null, teams.map((t, i) => {
+                        const d = t.phases[3], k = calcKPIs(d), c3 = calcPhase(3, d);
+                        return (React.createElement("tr", { key: i, style: { borderBottom: `1px solid ${C.faint}` } },
+                            React.createElement("td", { style: { padding: "8px 8px", fontWeight: 700, color: C.text, fontFamily: "Syne" } }, t.name),
+                            ["CFO", "Purchaser", "Builder"].map(role => {
+                                const e = kpiEarned(role, d), av = role === "CFO" ? k.cfo : role === "Purchaser" ? k.purchaser : k.builder, u = role === "Purchaser" ? "✦" : "%";
+                                return (React.createElement("td", { key: role, style: { textAlign: "center", padding: "8px 8px", fontFamily: "DM Mono" } }, av !== null ? React.createElement("div", null,
+                                    React.createElement("span", { style: { color: C.text } },
+                                        av,
+                                        u),
+                                    React.createElement("br", null),
+                                    e === null ? React.createElement("span", { style: { color: C.faint, fontSize: 10 } }, "\u2014") : e ? React.createElement("span", { style: { color: C.green, fontSize: 10, fontWeight: 700 } }, "\u2713") : React.createElement("span", { style: { color: C.red, fontSize: 10, fontWeight: 700 } }, "\u2717")) : React.createElement("span", { style: { color: C.faint } }, "\u2014")));
+                            }),
+                            React.createElement("td", { style: { textAlign: "center", padding: "8px 8px", fontFamily: "DM Mono" } }, c3 ? React.createElement("span", { style: { color: C.red, fontWeight: 700 } },
+                                "\u2212",
+                                c3.bonuses,
+                                "\u2726") : React.createElement("span", { style: { color: C.faint } }, "\u2014"))));
+                    })))))));
+}
+// ══════════════════════════════════════════════════════════════
+// FACILITATION SCREENS
+// ══════════════════════════════════════════════════════════════
+function WelcomeSc({ onStart }) {
+    const tot = PHASES.reduce((s, p) => s + p.duration, 0);
+    return (React.createElement("div", { className: "fu", style: { padding: 28, paddingTop: 64, maxWidth: 480, margin: "0 auto" } },
+        React.createElement("div", { style: { fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.1em", marginBottom: 12, textTransform: "uppercase" } }, "Instructor Guide"),
+        React.createElement("div", { style: { fontSize: 32, fontWeight: 800, lineHeight: 1.2, marginBottom: 8, letterSpacing: "-0.02em" } },
+            "Lego Aircraft",
+            React.createElement("br", null),
+            "Factory"),
+        React.createElement("div", { style: { fontSize: 14, color: C.muted, marginBottom: 40, lineHeight: 1.7 } }, "Step-by-step facilitation with live timers, facilitator cues, and integrated team tracking."),
+        React.createElement("div", { style: { display: "grid", gap: 10, marginBottom: 40 } },
+            PHASES.map(p => React.createElement("div", { key: p.number, style: { display: "flex", alignItems: "center", gap: 16, background: C.card, border: `1px solid ${p.color}33`, borderRadius: 12, padding: "14px 18px" } },
+                React.createElement("div", { style: { width: 10, height: 10, borderRadius: "50%", background: p.color, flexShrink: 0 } }),
+                React.createElement("div", { style: { flex: 1 } },
+                    React.createElement("div", { style: { fontSize: 12, color: p.color, fontWeight: 700, marginBottom: 2 } },
+                        p.label,
+                        " \u2014 ",
+                        p.title),
+                    React.createElement("div", { style: { fontSize: 12, color: C.muted } }, p.tagline)),
+                React.createElement("div", { className: "mono", style: { fontSize: 13, color: C.muted, flexShrink: 0 } },
+                    p.duration,
+                    "m"))),
+            React.createElement("div", { style: { display: "flex", justifyContent: "flex-end", paddingRight: 18 } },
+                React.createElement("span", { className: "mono", style: { fontSize: 12, color: C.muted } },
+                    "Total: ~",
+                    tot,
+                    " min"))),
+        React.createElement(Btn, { onClick: onStart, full: true, color: C.green }, "Start simulation \u2192")));
+}
+function AllPhasesSc({ onSelect, completedSteps }) {
+    return (React.createElement("div", { className: "fu", style: { padding: 24, paddingTop: 48, paddingBottom: 60 } },
+        React.createElement("div", { style: { fontSize: 11, color: C.muted, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8 } }, "Facilitation"),
+        React.createElement("div", { style: { fontSize: 26, fontWeight: 800, marginBottom: 28, letterSpacing: "-0.02em" } }, "Where are you?"),
+        React.createElement("div", { style: { display: "grid", gap: 14 } }, PHASES.map(p => {
+            const done = p.steps.filter(s => completedSteps.includes(s.id)).length, pct = done / p.steps.length;
+            return (React.createElement("button", { key: p.number, className: "tap", onClick: () => onSelect(p.number), style: { background: C.card, border: `1px solid ${pct === 1 ? p.color + "66" : C.border}`, borderRadius: 14, padding: "18px 20px", cursor: "pointer", textAlign: "left", fontFamily: "Syne" } },
+                React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 } },
+                    React.createElement("div", null,
+                        React.createElement(Pill, { color: p.color }, p.label),
+                        React.createElement("div", { style: { fontSize: 17, fontWeight: 800, marginTop: 8, marginBottom: 2 } }, p.title),
+                        React.createElement("div", { style: { fontSize: 12, color: C.muted } }, p.tagline)),
+                    React.createElement("div", { className: "mono", style: { fontSize: 13, color: C.muted, flexShrink: 0, marginLeft: 10 } },
+                        p.duration,
+                        "m")),
+                React.createElement("div", { style: { background: C.border, borderRadius: 999, height: 4, overflow: "hidden" } },
+                    React.createElement("div", { style: { background: p.color, width: `${pct * 100}%`, height: "100%", borderRadius: 999, transition: "width 0.4s" } })),
+                React.createElement("div", { style: { fontSize: 11, color: C.muted, marginTop: 6 } },
+                    done,
+                    "/",
+                    p.steps.length,
+                    " steps complete")));
+        }))));
+}
+function PhaseOverSc({ phaseNum, onSelectStep, onBack, completedSteps }) {
+    const phase = PHASES[phaseNum - 1];
+    return (React.createElement("div", { className: "fu", style: { padding: 24, paddingTop: 28, paddingBottom: 60 } },
+        React.createElement("button", { className: "tap", onClick: onBack, style: { background: "none", border: "none", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, marginBottom: 20, fontFamily: "Syne", fontSize: 13 } },
+            React.createElement(Chev, { dir: "left" }),
+            " All phases"),
+        React.createElement(Pill, { color: phase.color }, phase.label),
+        React.createElement("div", { style: { fontSize: 26, fontWeight: 800, marginTop: 10, marginBottom: 4, letterSpacing: "-0.02em" } }, phase.title),
+        React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 28 } }, phase.tagline),
+        React.createElement("div", { style: { display: "grid", gap: 10 } }, phase.steps.map((step, i) => {
+            const done = completedSteps.includes(step.id);
+            return (React.createElement("button", { key: step.id, className: "tap", onClick: () => onSelectStep(step.id), style: { background: done ? C.faint : C.card, border: `1px solid ${done ? C.green + "44" : C.border}`, borderRadius: 12, padding: "16px 18px", cursor: "pointer", display: "flex", alignItems: "center", gap: 14, textAlign: "left", fontFamily: "Syne" } },
+                React.createElement("div", { style: { width: 28, height: 28, borderRadius: "50%", flexShrink: 0, background: done ? C.green + "22" : C.faint, border: `1.5px solid ${done ? C.green : C.border}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, color: done ? C.green : C.muted } }, done ? "✓" : i + 1),
+                React.createElement("div", { style: { flex: 1 } },
+                    React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: done ? C.muted : C.text, marginBottom: 2 } }, step.title),
+                    React.createElement("div", { style: { fontSize: 12, color: C.muted } }, step.type === "check" ? "Checklist" : step.type === "debrief" ? "Debrief" : step.type === "settlement" ? "Settlement + Tracker" : step.duration > 0 ? `${step.duration} min` : "No timer")),
+                React.createElement(Chev, { color: C.muted })));
+        }))));
+}
+function CheckSc({ step, phase, onComplete, onBack }) {
+    const [checked, setChecked] = useState({});
+    const allDone = step.checks.every((_, i) => checked[i]);
+    return (React.createElement("div", { className: "fu", style: { padding: 24, paddingTop: 28, paddingBottom: 60 } },
+        React.createElement("button", { className: "tap", onClick: onBack, style: { background: "none", border: "none", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, marginBottom: 20, fontFamily: "Syne", fontSize: 13 } },
+            React.createElement(Chev, { dir: "left" }),
+            phase.label),
+        React.createElement(Pill, { color: phase.color }, phase.label),
+        React.createElement("div", { style: { fontSize: 24, fontWeight: 800, marginTop: 10, marginBottom: 6, letterSpacing: "-0.02em" } }, step.title),
+        React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 20, lineHeight: 1.7 } }, step.instruction),
+        step.say && React.createElement(Card, { color: phase.color, style: { marginBottom: 16 } },
+            React.createElement(SecLabel, { color: phase.color }, "Say to students"),
+            React.createElement("div", { style: { fontSize: 14, color: C.text, lineHeight: 1.8, fontStyle: "italic" } },
+                "\"",
+                step.say,
+                "\"")),
+        React.createElement(Card, { style: { marginBottom: 24 } },
+            React.createElement(SecLabel, null, "Setup checklist"),
+            React.createElement("div", { style: { display: "grid", gap: 12 } }, step.checks.map((item, i) => React.createElement("label", { key: i, style: { display: "flex", gap: 14, alignItems: "flex-start", cursor: "pointer" } },
+                React.createElement("input", { type: "checkbox", checked: !!checked[i], onChange: () => setChecked(c => ({ ...c, [i]: !c[i] })), style: { marginTop: 2 } }),
+                React.createElement("span", { style: { fontSize: 14, color: checked[i] ? C.muted : C.text, lineHeight: 1.6, textDecoration: checked[i] ? "line-through" : "none" } }, item))))),
+        React.createElement(Btn, { onClick: onComplete, full: true, color: allDone ? phase.color : C.muted, disabled: !allDone }, allDone ? "Ready — next step →" : `${Object.values(checked).filter(Boolean).length}/${step.checks.length} checked`)));
+}
+function TimedSc({ step, phase, onComplete, onBack, teams, onUpd }) {
+    const timer = useTimer(step.duration);
+    const isSett = step.type === "settlement";
+    return (React.createElement("div", { className: "fu", style: { padding: 24, paddingTop: 28, paddingBottom: 60 } },
+        React.createElement("button", { className: "tap", onClick: onBack, style: { background: "none", border: "none", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, marginBottom: 20, fontFamily: "Syne", fontSize: 13 } },
+            React.createElement(Chev, { dir: "left" }),
+            phase.label),
+        React.createElement(Pill, { color: phase.color }, phase.label),
+        React.createElement("div", { style: { fontSize: 24, fontWeight: 800, marginTop: 10, marginBottom: 6, letterSpacing: "-0.02em" } }, step.title),
+        React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 20, lineHeight: 1.7 } }, step.instruction),
+        step.say && React.createElement(Card, { color: phase.color, style: { marginBottom: 16 } },
+            React.createElement(SecLabel, { color: phase.color }, "Say to students"),
+            React.createElement("div", { style: { fontSize: 14, color: C.text, lineHeight: 1.8, fontStyle: "italic" } },
+                "\"",
+                step.say,
+                "\"")),
+        step.duration > 0 && React.createElement(Card, { style: { marginBottom: 16 } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 20 } },
+                React.createElement(Ring, { ...timer, color: phase.color }),
+                React.createElement("div", { style: { flex: 1, display: "grid", gap: 8 } },
+                    !timer.running && !timer.done && React.createElement(Btn, { onClick: timer.start, color: phase.color, full: true }, "\u25B6 Start timer"),
+                    timer.running && React.createElement(Btn, { onClick: timer.pause, color: C.warn, outline: true, full: true }, "\u23F8 Pause"),
+                    !timer.running && timer.rem !== timer.total && React.createElement(Btn, { onClick: timer.reset, color: C.muted, outline: true, small: true, full: true }, "\u21BA Reset"),
+                    timer.done && React.createElement("div", { className: "pu", style: { fontSize: 13, fontWeight: 700, color: C.red, textAlign: "center" } }, "Time is up!")))),
+        isSett && React.createElement(Expand, { title: `📊 Quick results — Phase ${step.settlementPhase}`, color: phase.color, icon: "\uD83D\uDCCA", open: true },
+            React.createElement(QuickEntry, { teams: teams, phase: step.settlementPhase, onUpd: onUpd })),
+        step.bankNote && React.createElement(Expand, { title: "Bank instructions", color: C.warn, icon: "\uD83C\uDFE6" },
+            React.createElement("div", { style: { fontSize: 13, color: C.text, lineHeight: 1.8 } }, step.bankNote)),
+        step.customerNote && React.createElement(Expand, { title: "Customer instructions", color: C.p3, icon: "\uD83D\uDC64" },
+            React.createElement("div", { style: { fontSize: 13, color: C.text, lineHeight: 1.8 } }, step.customerNote)),
+        step.watchFor?.length > 0 && React.createElement(Expand, { title: `Watch for (${step.watchFor.length})`, color: C.muted, icon: "\uD83D\uDC41" },
+            React.createElement("div", { style: { display: "grid", gap: 10 } }, step.watchFor.map((w, i) => React.createElement("div", { key: i, style: { display: "flex", gap: 10, alignItems: "flex-start" } },
+                React.createElement("div", { style: { width: 6, height: 6, borderRadius: "50%", background: C.warn, flexShrink: 0, marginTop: 6 } }),
+                React.createElement("div", { style: { fontSize: 13, color: C.muted, lineHeight: 1.6 } }, w))))),
+        step.interventions?.length > 0 && React.createElement(Expand, { title: `Interventions (${step.interventions.length})`, color: C.red, icon: "\uD83D\uDEA8" },
+            React.createElement("div", { style: { display: "grid", gap: 12 } }, step.interventions.map((iv, i) => React.createElement("div", { key: i, style: { background: C.faint, borderRadius: 10, padding: 14 } },
+                React.createElement("div", { style: { fontSize: 12, color: C.red, fontWeight: 700, marginBottom: 6 } },
+                    "IF: ",
+                    iv.trigger),
+                React.createElement("div", { style: { fontSize: 13, color: C.text, lineHeight: 1.6 } },
+                    "\u2192 ",
+                    iv.response))))),
+        React.createElement("div", { style: { marginTop: 20 } },
+            React.createElement(Btn, { onClick: onComplete, full: true, color: phase.color }, "Done \u2014 next step \u2192"))));
+}
+function DebriefSc({ step, phase, onComplete, onBack }) {
+    const [qi, setQi] = useState(0);
+    const isLast = qi === step.debrief.length - 1;
+    return (React.createElement("div", { className: "fu", style: { padding: 24, paddingTop: 28, paddingBottom: 60 } },
+        React.createElement("button", { className: "tap", onClick: onBack, style: { background: "none", border: "none", color: C.muted, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, marginBottom: 20, fontFamily: "Syne", fontSize: 13 } },
+            React.createElement(Chev, { dir: "left" }),
+            phase.label),
+        React.createElement(Pill, { color: phase.color },
+            phase.label,
+            " \u2014 Debrief"),
+        React.createElement("div", { style: { fontSize: 24, fontWeight: 800, marginTop: 10, marginBottom: 6, letterSpacing: "-0.02em" } }, step.title),
+        React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 20, lineHeight: 1.7 } }, step.instruction),
+        React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 24 } }, step.debrief.map((_, i) => React.createElement("div", { key: i, className: "tap", onClick: () => setQi(i), style: { flex: 1, height: 5, borderRadius: 3, background: i < qi ? phase.color + "66" : i === qi ? phase.color : C.border, cursor: "pointer", transition: "all 0.2s" } }))),
+        step.debrief.map((q, i) => i === qi && React.createElement("div", { key: i, className: "fu" },
+            React.createElement(Card, { color: phase.color, style: { marginBottom: 14 } },
+                React.createElement("div", { style: { fontSize: 11, color: phase.color, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 10, textTransform: "uppercase" } }, "Ask the group"),
+                React.createElement("div", { style: { fontSize: 16, fontWeight: 700, color: C.text, lineHeight: 1.6 } },
+                    "\"",
+                    q.q,
+                    "\"")),
+            React.createElement(Expand, { title: "Expected response", color: C.green, icon: "\uD83D\uDCA1" },
+                React.createElement("div", { style: { fontSize: 13, color: C.text, lineHeight: 1.7 } }, q.expected)),
+            React.createElement(Expand, { title: "Follow-up question", color: C.muted, icon: "\u21B3" },
+                React.createElement("div", { style: { fontSize: 14, color: C.text, fontStyle: "italic", lineHeight: 1.7 } },
+                    "\"",
+                    q.followUp,
+                    "\"")))),
+        React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 20 } },
+            qi > 0 && React.createElement(Btn, { onClick: () => setQi(q => q - 1), outline: true, color: C.muted, style: { flex: 1 } }, "\u2190 Prev"),
+            !isLast ? React.createElement(Btn, { onClick: () => setQi(q => q + 1), color: phase.color, style: { flex: 1 } }, "Next \u2192") : React.createElement(Btn, { onClick: () => { }, color: C.muted, outline: true, style: { flex: 1, pointerEvents: "none" } }, "Last question")),
+        React.createElement(Card, { style: { marginTop: 24, border: `1px solid ${phase.color}44` } },
+            React.createElement(SecLabel, { color: phase.color },
+                "Bridge",
+                step.synthesis ? " — synthesis" : ` to Phase ${phase.number + 1}`),
+            React.createElement("div", { style: { fontSize: 14, color: C.text, lineHeight: 1.8, fontStyle: "italic" } },
+                "\"",
+                step.bridge,
+                "\"")),
+        React.createElement("div", { style: { marginTop: 20 } },
+            React.createElement(Btn, { onClick: onComplete, full: true, color: phase.color }, phase.number < 3 ? `Start Phase ${phase.number + 1} →` : "Simulation complete ✓"))));
+}
+function CompleteSc({ onRestart }) {
+    return (React.createElement("div", { className: "fu", style: { padding: 28, paddingTop: 80, textAlign: "center", maxWidth: 400, margin: "0 auto" } },
+        React.createElement("div", { style: { fontSize: 52, marginBottom: 16 } }, "\uD83C\uDFC1"),
+        React.createElement("div", { style: { fontSize: 28, fontWeight: 800, marginBottom: 8, letterSpacing: "-0.02em" } }, "Simulation complete"),
+        React.createElement("div", { style: { fontSize: 14, color: C.muted, marginBottom: 48, lineHeight: 1.8 } }, "All three phases done. Run the final synthesis debrief, then close out."),
+        React.createElement(Btn, { onClick: onRestart, full: true, outline: true, color: C.muted }, "Run again \u21BA")));
+}
+// ══════════════════════════════════════════════════════════════
+// APP
+// ══════════════════════════════════════════════════════════════
+function App() {
+    const [screen, setScreen] = useState("welcome");
+    const [activePhase, setActivePhase] = useState(1);
+    const [activeStep, setActiveStep] = useState(null);
+    const [completedSteps, setCompletedSteps] = useState([]);
+    const [mainTab, setMainTab] = useState("facilitation");
+    const [trackerTab, setTrackerTab] = useState("setup");
+    const [teams, setTeams] = useState([]);
+    const [newName, setNewName] = useState("");
+    const [loaded, setLoaded] = useState(false);
+    useEffect(() => {
+        Promise.all([loadI(), loadS()]).then(([inst, sim]) => {
+            if (inst) {
+                if (inst.screen)
+                    setScreen(inst.screen);
+                if (inst.activePhase)
+                    setActivePhase(inst.activePhase);
+                if (inst.activeStep)
+                    setActiveStep(inst.activeStep);
+                if (inst.completedSteps)
+                    setCompletedSteps(inst.completedSteps);
+                if (inst.mainTab)
+                    setMainTab(inst.mainTab);
+            }
+            if (sim?.teams)
+                setTeams(sim.teams);
+            setLoaded(true);
+        });
+    }, []);
+    const pI = useCallback((patch) => {
+        const next = { screen, activePhase, activeStep, completedSteps, mainTab, ...patch };
+        if (patch.screen !== undefined)
+            setScreen(patch.screen);
+        if (patch.activePhase !== undefined)
+            setActivePhase(patch.activePhase);
+        if (patch.activeStep !== undefined)
+            setActiveStep(patch.activeStep);
+        if (patch.completedSteps !== undefined)
+            setCompletedSteps(patch.completedSteps);
+        if (patch.mainTab !== undefined)
+            setMainTab(patch.mainTab);
+        saveI(next);
+    }, [screen, activePhase, activeStep, completedSteps, mainTab]);
+    const pT = useCallback((t) => { setTeams(t); saveS({ teams: t }); }, []);
+    const updTeam = useCallback((ti, ph, k, v) => {
+        const next = teams.map((t, i) => i !== ti ? t : { ...t, phases: { ...t.phases, [ph]: { ...t.phases[ph], [k]: v } } });
+        pT(next);
+    }, [teams, pT]);
+    const markDone = useCallback(id => completedSteps.includes(id) ? completedSteps : [...completedSteps, id], [completedSteps]);
+    const nextStep = useCallback((curId, phNum) => {
+        const ph = PHASES[phNum - 1], idx = ph.steps.findIndex(s => s.id === curId), done = markDone(curId);
+        if (idx < ph.steps.length - 1) {
+            pI({ completedSteps: done, activeStep: ph.steps[idx + 1].id, screen: "step" });
+        }
+        else if (phNum < 3) {
+            pI({ completedSteps: done, activePhase: phNum + 1, screen: "phaseOverview" });
+        }
+        else {
+            pI({ completedSteps: done, screen: "complete" });
+        }
+    }, [markDone, pI]);
+    const getStep = id => { for (const p of PHASES) {
+        const s = p.steps.find(s => s.id === id);
+        if (s)
+            return { step: s, phase: p };
+    } return null; };
+    const renderFac = () => {
+        if (screen === "welcome")
+            return (React.createElement(WelcomeSc, { onStart: () => pI({ screen: "phases" }) }));
+        if (screen === "phases")
+            return (React.createElement(AllPhasesSc, { completedSteps: completedSteps, onSelect: p => pI({ screen: "phaseOverview", activePhase: p }) }));
+        if (screen === "phaseOverview")
+            return (React.createElement(PhaseOverSc, { phaseNum: activePhase, completedSteps: completedSteps, onSelectStep: id => pI({ screen: "step", activeStep: id }), onBack: () => pI({ screen: "phases" }) }));
+        if (screen === "step") {
+            const f = getStep(activeStep);
+            if (!f)
+                return null;
+            const { step, phase } = f;
+            const props = { step, phase, onComplete: () => nextStep(step.id, phase.number), onBack: () => pI({ screen: "phaseOverview", activePhase: phase.number }), teams, onUpd: updTeam };
+            if (step.type === "check")
+                return (React.createElement(CheckSc, { ...props }));
+            if (step.type === "debrief")
+                return (React.createElement(DebriefSc, { ...props }));
+            return (React.createElement(TimedSc, { ...props }));
+        }
+        if (screen === "complete")
+            return (React.createElement(CompleteSc, { onRestart: () => { pI({ screen: "welcome", completedSteps: [], activePhase: 1, activeStep: null }); setCompletedSteps([]); } }));
+        return null;
+    };
+    const renderTracker = () => (React.createElement("div", { className: "fu", style: { padding: 24, paddingBottom: 60 } },
+        React.createElement("div", { style: { fontSize: 20, fontWeight: 800, marginBottom: 4, marginTop: 20 } }, "Team Tracker"),
+        React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 20 } }, "Enter results during settlement. View overview for debrief."),
+        React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 24, overflowX: "auto", paddingBottom: 4 } }, [{ id: "setup", l: "Setup" }, { id: "p1", l: "P1" }, { id: "p2", l: "P2" }, { id: "p3", l: "P3" }, { id: "overview", l: "Overview" }].map(t => (React.createElement("button", { key: t.id, className: "tap", onClick: () => setTrackerTab(t.id), style: { background: trackerTab === t.id ? C.faint : "transparent", border: `1px solid ${trackerTab === t.id ? C.border : "transparent"}`, borderRadius: 8, padding: "7px 14px", cursor: "pointer", fontFamily: "Syne", fontSize: 12, fontWeight: 700, color: trackerTab === t.id ? C.text : C.muted, whiteSpace: "nowrap" } }, t.l)))),
+        trackerTab === "setup" && React.createElement("div", null,
+            React.createElement(SecLabel, null, "Teams"),
+            React.createElement("div", { style: { display: "flex", gap: 10, marginBottom: 16 } },
+                React.createElement("input", { type: "text", value: newName, onChange: e => setNewName(e.target.value), placeholder: "Team name", onKeyDown: e => e.key === "Enter" && (() => { const nm = newName.trim() || `Team ${teams.length + 1}`; pT([...teams, defaultTeam(nm)]); setNewName(""); })(), style: { flex: 1 } }),
+                React.createElement(Btn, { onClick: () => { const nm = newName.trim() || `Team ${teams.length + 1}`; pT([...teams, defaultTeam(nm)]); setNewName(""); }, color: C.green, small: true }, "Add")),
+            !teams.length && React.createElement("div", { style: { color: C.muted, fontSize: 13, textAlign: "center", padding: "16px 0" } }, "No teams yet."),
+            React.createElement("div", { style: { display: "grid", gap: 8 } }, teams.map((t, i) => React.createElement("div", { key: i, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.faint, borderRadius: 10, padding: "10px 14px" } },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
+                    React.createElement("div", { style: { width: 8, height: 8, borderRadius: "50%", background: C.green } }),
+                    React.createElement("span", { style: { fontWeight: 700, fontSize: 14 } }, t.name)),
+                React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
+                    [1, 2, 3].map(p => { const c = calcPhase(p, t.phases[p]); return (React.createElement(STag, { key: p, balance: c ? c.balance : null })); }),
+                    React.createElement("button", { className: "tap", onClick: () => pT(teams.filter((_, idx) => idx !== i)), style: { background: "none", border: `1px solid ${C.border}`, color: C.muted, borderRadius: 6, padding: "3px 8px", cursor: "pointer", fontSize: 12 } }, "\u2715")))))),
+        trackerTab === "p1" && React.createElement(FullTrackerPhase, { teams: teams, phase: 1, onUpd: updTeam }),
+        trackerTab === "p2" && React.createElement(FullTrackerPhase, { teams: teams, phase: 2, onUpd: updTeam }),
+        trackerTab === "p3" && React.createElement(FullTrackerPhase, { teams: teams, phase: 3, onUpd: updTeam }),
+        trackerTab === "overview" && React.createElement(Overview, { teams: teams })));
+    if (!loaded)
+        return (React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: C.bg, color: C.muted } }, "Loading\u2026"));
+    const showNav = screen !== "welcome" || mainTab === "tracker";
+    return (React.createElement(React.Fragment, null,
+        React.createElement("style", null, css),
+        React.createElement("div", { style: { background: C.bg, minHeight: "100vh", maxWidth: 480, margin: "0 auto", paddingBottom: showNav ? 72 : 0 } },
+            mainTab === "facilitation" && renderFac(),
+            mainTab === "tracker" && renderTracker(),
+            showNav && React.createElement("div", { style: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, background: C.surface, borderTop: `1px solid ${C.border}`, display: "flex", padding: "10px 20px 16px", gap: 6 } },
+                PHASES.map(p => {
+                    const done = p.steps.filter(s => completedSteps.includes(s.id)).length;
+                    const active = mainTab === "facilitation" && activePhase === p.number && screen !== "welcome" && screen !== "phases" && screen !== "complete";
+                    return (React.createElement("button", { key: p.number, className: "tap", onClick: () => pI({ mainTab: "facilitation", screen: "phaseOverview", activePhase: p.number }), style: { flex: 1, background: active ? p.color + "22" : "transparent", border: `1px solid ${active ? p.color + "66" : C.border}`, borderRadius: 10, padding: "8px 4px", cursor: "pointer", fontFamily: "Syne" } },
+                        React.createElement("div", { style: { fontSize: 10, fontWeight: 800, color: active ? p.color : C.muted, marginBottom: 3, letterSpacing: "0.06em" } },
+                            "P",
+                            p.number),
+                        React.createElement("div", { style: { background: C.border, borderRadius: 999, height: 3, overflow: "hidden" } },
+                            React.createElement("div", { style: { background: p.color, width: `${(done / p.steps.length) * 100}%`, height: "100%", borderRadius: 999 } }))));
+                }),
+                React.createElement("button", { className: "tap", onClick: () => pI({ mainTab: "tracker" }), style: { flex: 1.2, background: mainTab === "tracker" ? C.teal + "22" : "transparent", border: `1px solid ${mainTab === "tracker" ? C.teal + "66" : C.border}`, borderRadius: 10, padding: "8px 6px", cursor: "pointer", fontFamily: "Syne" } },
+                    React.createElement("div", { style: { fontSize: 16, marginBottom: 2 } }, "\uD83D\uDCCA"),
+                    React.createElement("div", { style: { fontSize: 9, fontWeight: 700, color: mainTab === "tracker" ? C.teal : C.muted, letterSpacing: "0.04em" } }, "TRACKER")),
+                React.createElement("button", { className: "tap", onClick: () => pI({ mainTab: "facilitation", screen: "phases" }), style: { background: mainTab === "facilitation" && screen === "phases" ? C.faint : "transparent", border: `1px solid ${mainTab === "facilitation" && screen === "phases" ? C.border : "transparent"}`, borderRadius: 10, padding: "8px 10px", cursor: "pointer" } },
+                    React.createElement("div", { style: { fontSize: 18 } }, "\u2630"))))));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App, null));
+
+</script>
+</body>
+</html>
